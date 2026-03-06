@@ -1,5 +1,6 @@
 from transformers import PretrainedConfig
-
+import torch 
+import torch.nn as nn
 
 # 继承PretrainedConfig从而传到huggingface
 class MokioMindConfig(PretrainedConfig):
@@ -70,3 +71,19 @@ class MokioMindConfig(PretrainedConfig):
             if self.inference_rope_scaling
             else None
         )
+
+
+class RMSNorm(nn.Module):
+    def __init__(self, dim: int, eps=1e-5):
+        super().__init__()
+        self.dim = dim
+        self.eps = eps
+        self.weight = nn.parameter(torch.ones(dim))
+
+
+    def _norm(self, x):
+        # [batch_size, n_token, dim] 只对x本身做大小的调整
+        return  torch.rsqrt(torch.mean(x**2, dim=-1, keepdim=True) + self.eps)  # [batch_size, n_token, 1]
+        
+    def forward(self, x):
+        return x * self._norm(x.float()).type_as(x) * self.weight
