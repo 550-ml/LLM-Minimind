@@ -52,3 +52,7 @@ dataset/*.json
 # Local environment files
 .env
 .env.*
+
+#
+dataset/*temp
+dataset/*.msc

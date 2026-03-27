@@ -527,7 +527,7 @@ if __name__ == "__main__":
         )
     # ========== 5. 初始化模型和数据 ==========
     # 📚 PPO模型架构
-    base_weight = "reason" if args.reasoning == 1 else "full_sft"
+    base_weight = "reason" if args.reasoning == 1 else "full_sft_minibig_512_1024"
 
     # 📚 Actor模型（策略模型）
     actor_model, tokenizer = init_model(lm_config, base_weight, device=args.device)
@@ -553,11 +553,11 @@ if __name__ == "__main__":
 
     # 📚 Reward模型（奖励函数）
     reward_model = AutoModel.from_pretrained(
-        args.reward_model_path, torch_dtype=torch.float16, trust_remote_code=True
+        args.reward_model_path, torch_dtype=torch.float16, trust_remote_code=True, local_files_only=True
     )
     reward_model = reward_model.to(args.device).eval().requires_grad_(False)
     reward_tokenizer = AutoTokenizer.from_pretrained(
-        args.reward_model_path, trust_remote_code=True
+        args.reward_model_path, trust_remote_code=True, local_files_only=True
     )
 
     # 📚 数据和优化器

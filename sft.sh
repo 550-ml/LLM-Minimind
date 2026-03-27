@@ -7,5 +7,10 @@
 
 CUDA_VISIBLE_DEVICES=0,2,3,4,5 torchrun --nproc_per_node=5 trainer/trainer_full_sft.py \
   --use_wandb \
-  --batch_size 39 \
-  --learning_rate 5e-5
+  --save_weight full_sft_minibig_512_1024 \
+  --from_weight full_sft_minibig_512 \
+  --data_path ./dataset/sft_1024.jsonl \
+  --batch_size 14 \
+  --epochs 1 \
+  --learning_rate 5e-6 \
+  --max_seq_len 1024

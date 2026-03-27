@@ -3,5 +3,5 @@
 https://www.modelscope.cn/datasets/gongjy/minimind_dataset/files
 ```
 
-modelscope download --dataset gongjy/minimind_dataset rlaif-mini.jsonl --local_dir ./dataset
+modelscope download --dataset gongjy/minimind_dataset sft_2048.jsonl --local_dir ./dataset
 ```
