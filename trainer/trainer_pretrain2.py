@@ -197,10 +197,17 @@ if __name__ == "__main__":
         wandb_run_name = f"NanoMind-Pretrain-Epoch-{args.epochs}-BatchSize-{args.batch_size}-LearningRate-{args.learning_rate}"
         wandb.init(project=args.wandb_project, name=wandb_run_name, id=wandb_id, resume=resume)
     
-    # ========== 5. 定义模型、数据、优化器 ==========
+    # ========== 5. 定义模型、数据 ==========
     model, tokenizer = init_model(lm_config, args.from_weight, device=args.device)
     train_ds = PretrainDataset(args.data_path, tokenizer, max_length=args.max_seq_len)
     train_sampler = DistributedSampler(train_ds) if dist.is_initialized() else None
+
+    # ========== 6. 编译（必须早于resume加载；否则state_dict key会不匹配） ==========
+    if args.use_compile == 1:
+        model = torch.compile(model)
+        Logger('torch.compile enabled')
+
+    # ========== 7. 优化器/Scaler（在compile之后构建） ==========
     scaler = torch.cuda.amp.GradScaler(enabled=(args.dtype == 'float16'))
     optimizer = optim.AdamW(model.parameters(), lr=args.learning_rate)
 
@@ -224,7 +231,7 @@ if __name__ == "__main__":
         f"total_optimizer_steps={total_optimizer_steps}, final_lr_frac={args.final_lr_frac}"
     )
     
-    # ========== 6. 从ckp恢复状态 ==========
+    # ========== 8. 从ckp恢复状态（在DDP包装之前加载） ==========
     start_epoch, start_step = 0, 0
     if ckp_data:
         model.load_state_dict(ckp_data['model'])
@@ -233,15 +240,12 @@ if __name__ == "__main__":
         start_epoch = ckp_data['epoch']
         start_step = ckp_data.get('step', 0)
     
-    # ========== 7. 编译和分布式包装 ==========
-    if args.use_compile == 1:
-        model = torch.compile(model)
-        Logger('torch.compile enabled')
+    # ========== 9. 分布式包装 ==========
     if dist.is_initialized():
         model._ddp_params_and_buffers_to_ignore = {"freqs_cos", "freqs_sin"}
         model = DistributedDataParallel(model, device_ids=[local_rank])
     
-    # ========== 8. 开始训练 ==========
+    # ========== 10. 开始训练 ==========
     for epoch in range(start_epoch, args.epochs):
         train_sampler and train_sampler.set_epoch(epoch)
         setup_seed(42 + epoch); indices = torch.randperm(len(train_ds)).tolist()
@@ -254,5 +258,5 @@ if __name__ == "__main__":
         else:
             train_epoch(epoch, loader, len(loader), 0, wandb)
     
-    # ========== 9. 清理分布进程 ==========
+    # ========== 11. 清理分布进程 ==========
     if dist.is_initialized(): dist.destroy_process_group()
