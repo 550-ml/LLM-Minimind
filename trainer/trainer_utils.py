@@ -102,10 +102,10 @@ def lm_checkpoint(
     if model is not None:
         from torch.nn.parallel import DistributedDataParallel
 
-        if isinstance(model, DistributedDataParallel):
-            state_dict = model.module.state_dict()
-        else:
-            state_dict = model.state_dict()
+        raw = model.module if isinstance(model, DistributedDataParallel) else model
+        # torch.compile 包一层后 state_dict key 会带 _orig_mod.，与 train_epoch 里存权重逻辑对齐
+        raw = getattr(raw, "_orig_mod", raw)
+        state_dict = raw.state_dict()
 
         ckp_tmp = ckp_path + ".tmp"
         torch.save({k: v.half() for k, v in state_dict.items()}, ckp_tmp)

@@ -132,7 +132,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--final_lr_frac",
         type=float,
-        default=0.001,
+        default=0.0001,
         help="线性衰减结束时的学习率比例",
     )
     parser.add_argument(

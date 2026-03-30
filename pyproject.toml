@@ -11,7 +11,8 @@ dependencies = [
     "transformers>=4.57.1",
     "modelscope",
     "datasets",
-    "swanlab"
+    "swanlab",
+    "openai"
 ]
 [tool.uv]
 index-url = "https://pypi.tuna.tsinghua.edu.cn/simple"

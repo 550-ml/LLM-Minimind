@@ -1,247 +1,110 @@
+import time
 import argparse
-import os
 import random
 import warnings
-import numpy as np
 import torch
 from transformers import AutoTokenizer, AutoModelForCausalLM, TextStreamer
-from model.MokioModel import MokioMindConfig, MokioMindForCausalLM
-from model.model_lora import apply_lora, load_lora
-from trainer.trainer_utils import setup_seed
+from model.NanoMind import NanoMindConfig, NanoMindForCausalLM
+from model.model_lora import *
+from trainer.trainer_utils import setup_seed, Logger
+warnings.filterwarnings('ignore')
 
-warnings.filterwarnings("ignore")
+def _strip_checkpoint_key(key: str) -> str:
+    k = key
+    while k.startswith("_orig_mod.") or k.startswith("module."):
+        if k.startswith("_orig_mod."):
+            k = k[len("_orig_mod."):]
+        if k.startswith("module."):
+            k = k[len("module."):]
+    return k
 
-PROJECT_ROOT = os.path.abspath(os.path.dirname(__file__))
-KNOWN_WEIGHT_PREFIXES = {
-    "pretrain",
-    "full_sft",
-    "rlhf",
-    "reason",
-    "ppo_actor",
-    "grpo",
-    "spo",
-}
-
-
-def _resolve_path(path: str) -> str:
-    return path if os.path.isabs(path) else os.path.abspath(os.path.join(PROJECT_ROOT, path))
-
-
-def _is_torch_weight_path(path: str) -> bool:
-    return os.path.isfile(path) and path.endswith((".pth", ".pt", ".bin"))
-
-
-def _build_local_weight_path(args) -> str:
-    moe_suffix = "_moe" if getattr(args, "use_moe", 0) else ""
-    save_dir = _resolve_path(args.save_dir)
-    return os.path.join(save_dir, f"{args.weight}_{args.hidden_size}{moe_suffix}.pth")
-
-
-def _infer_weight_name(args) -> str:
-    candidates = [args.load_from, os.path.basename(args.load_from)]
-    for candidate in candidates:
-        stem = candidate.split("/")[-1].split(".")[0]
-        for prefix in sorted(KNOWN_WEIGHT_PREFIXES, key=len, reverse=True):
-            if stem == prefix or stem.startswith(prefix + "_"):
-                return prefix
-    return args.weight
-
+def _load_model_state_dict(path, map_location):
+    ckpt = torch.load(path, map_location=map_location)
+    if isinstance(ckpt, dict) and "model" in ckpt and isinstance(ckpt["model"], dict):
+        ckpt = ckpt["model"]
+    return {_strip_checkpoint_key(k): v for k, v in ckpt.items()}
 
 def init_model(args):
-    load_from = args.load_from
-    load_from_path = _resolve_path(load_from)
-
-    is_local_torch_weight = _is_torch_weight_path(load_from_path)
-    is_builtin_local_mode = load_from in {"model", "./model"}
-
-    if is_local_torch_weight or is_builtin_local_mode:
-        tokenizer_path = _resolve_path(args.tokenizer_path)
-        if not os.path.isdir(tokenizer_path):
-            raise FileNotFoundError(
-                f"Tokenizer目录不存在: {tokenizer_path}\n"
-                "请传入 --tokenizer_path 指向包含 tokenizer.json/tokenizer_config.json 的目录"
-            )
-        tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
-
-        model = MokioMindForCausalLM(
-            MokioMindConfig(
-                hidden_size=args.hidden_size,
-                num_hidden_layers=args.num_hidden_layers,
-                use_moe=bool(args.use_moe),
-                inference_rope_scaling=args.inference_rope_scaling,
-            )
-        )
-
-        ckp = load_from_path if is_local_torch_weight else _build_local_weight_path(args)
-        if not os.path.isfile(ckp):
-            raise FileNotFoundError(
-                f"模型权重不存在: {ckp}\n"
-                "可选做法:\n"
-                "1) 直接传 --load_from /path/to/xxx.pth\n"
-                "2) 传 --load_from model 并配合 --save_dir/--weight/--hidden_size"
-            )
-
-        state_dict = torch.load(ckp, map_location=args.device)
-        model.load_state_dict(state_dict, strict=True)
-
-        if args.lora_weight != "None":
-            lora_ckp = os.path.join(
-                _resolve_path(args.save_dir),
-                "lora",
-                f"{args.lora_weight}_{args.hidden_size}.pth",
-            )
-            if not os.path.isfile(lora_ckp):
-                raise FileNotFoundError(f"LoRA权重不存在: {lora_ckp}")
+    tokenizer = AutoTokenizer.from_pretrained(args.load_from)
+    if 'model' in args.load_from:
+        model = NanoMindForCausalLM(NanoMindConfig(
+            hidden_size=args.hidden_size,
+            num_hidden_layers=args.num_hidden_layers,
+            use_moe=bool(args.use_moe),
+            inference_rope_scaling=args.inference_rope_scaling
+        ))
+        moe_suffix = '_moe' if args.use_moe else ''
+        ckp = f'./{args.save_dir}/{args.weight}_{args.hidden_size}{moe_suffix}.pth'
+        model.load_state_dict(_load_model_state_dict(ckp, args.device), strict=True)
+        if args.lora_weight != 'None':
             apply_lora(model)
-            load_lora(model, lora_ckp)
+            load_lora(model, f'./{args.save_dir}/{args.lora_weight}_{args.hidden_size}.pth')
     else:
-        hf_source = load_from_path if os.path.isdir(load_from_path) else load_from
-        tokenizer = AutoTokenizer.from_pretrained(hf_source, trust_remote_code=True)
-        model = AutoModelForCausalLM.from_pretrained(hf_source, trust_remote_code=True)
-
-    print(f"MokioMind模型参数: {sum(p.numel() for p in model.parameters()) / 1e6:.2f} M(illion)")
-    return model.eval().to(args.device), tokenizer
-
+        model = AutoModelForCausalLM.from_pretrained(args.load_from, trust_remote_code=True)
+    total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    Logger(f"所加载Model可训练参数：{total_params / 1e6:.3f} 百万")
+    return model.half().eval().to(args.device), tokenizer
 
 def main():
-    parser = argparse.ArgumentParser(description="MokioMind模型推理与对话")
-    parser.add_argument(
-        "--load_from",
-        default="model",
-        type=str,
-        help="加载来源：model(本地原生权重模式)/本地.pth文件/transformers目录或模型ID",
-    )
-    parser.add_argument(
-        "--tokenizer_path",
-        default="model",
-        type=str,
-        help="分词器目录（本地原生权重模式下使用）",
-    )
-    parser.add_argument("--save_dir", default="out", type=str, help="模型权重目录")
-    parser.add_argument(
-        "--weight",
-        default="pretrain",
-        type=str,
-        help="权重名称前缀（pretrain, full_sft, rlhf, reason, ppo_actor, grpo, spo）",
-    )
-    parser.add_argument(
-        "--lora_weight",
-        default="None",
-        type=str,
-        help="LoRA权重名称（None表示不使用，可选：lora_identity, lora_medical）",
-    )
-    parser.add_argument(
-        "--hidden_size",
-        default=512,
-        type=int,
-        help="隐藏层维度（512=Small-26M, 640=MoE-145M, 768=Base-104M）",
-    )
-    parser.add_argument(
-        "--num_hidden_layers",
-        default=8,
-        type=int,
-        help="隐藏层数量（Small/MoE=8, Base=16）",
-    )
-    parser.add_argument(
-        "--use_moe",
-        default=0,
-        type=int,
-        choices=[0, 1],
-        help="是否使用MoE架构（0=否，1=是）",
-    )
-    parser.add_argument(
-        "--inference_rope_scaling",
-        default=False,
-        action="store_true",
-        help="启用RoPE位置编码外推（4倍，仅解决位置编码问题）",
-    )
-    parser.add_argument(
-        "--max_new_tokens",
-        default=8192,
-        type=int,
-        help="最大生成长度（注意：并非模型实际长文本能力）",
-    )
-    parser.add_argument(
-        "--temperature",
-        default=0.85,
-        type=float,
-        help="生成温度，控制随机性（0-1，越大越随机）",
-    )
-    parser.add_argument(
-        "--top_p", default=0.85, type=float, help="nucleus采样阈值（0-1）"
-    )
-    parser.add_argument(
-        "--historys",
-        default=0,
-        type=int,
-        help="携带历史对话轮数（需为偶数，0表示不携带历史）",
-    )
-    parser.add_argument(
-        "--device",
-        default="cuda" if torch.cuda.is_available() else "cpu",
-        type=str,
-        help="运行设备",
-    )
+    parser = argparse.ArgumentParser(description="MiniMind模型推理与对话")
+    parser.add_argument('--load_from', default='model', type=str, help="模型加载路径（model=原生torch权重，其他路径=transformers格式）")
+    parser.add_argument('--save_dir', default='out', type=str, help="模型权重目录")
+    parser.add_argument('--weight', default='full_sft', type=str, help="权重名称前缀（pretrain, full_sft, rlhf, reason, ppo_actor, grpo, spo）")
+    parser.add_argument('--lora_weight', default='None', type=str, help="LoRA权重名称（None表示不使用，可选：lora_identity, lora_medical）")
+    parser.add_argument('--hidden_size', default=768, type=int, help="隐藏层维度")
+    parser.add_argument('--num_hidden_layers', default=8, type=int, help="隐藏层数量")
+    parser.add_argument('--use_moe', default=0, type=int, choices=[0, 1], help="是否使用MoE架构（0=否，1=是）")
+    parser.add_argument('--inference_rope_scaling', default=False, action='store_true', help="启用RoPE位置编码外推（4倍，仅解决位置编码问题）")
+    parser.add_argument('--max_new_tokens', default=8192, type=int, help="最大生成长度（注意：并非模型实际长文本能力）")
+    parser.add_argument('--temperature', default=0.85, type=float, help="生成温度，控制随机性（0-1，越大越随机）")
+    parser.add_argument('--top_p', default=0.95, type=float, help="nucleus采样阈值（0-1）")
+    parser.add_argument('--open_thinking', default=0, type=int, help="是否开启自适应思考（0=否，1=是）")
+    parser.add_argument('--historys', default=0, type=int, help="携带历史对话轮数（需为偶数，0表示不携带历史）")
+    parser.add_argument('--show_speed', default=1, type=int, help="显示decode速度（tokens/s）")
+    parser.add_argument('--device', default='cuda' if torch.cuda.is_available() else 'cpu', type=str, help="运行设备")
     args = parser.parse_args()
-    args.weight = _infer_weight_name(args)
-
+    
     prompts = [
-        "你有什么特长？",
-        "为什么天空是蓝色的",
-        "请用Python写一个计算斐波那契数列的函数",
+        '你有什么特长？',
+        '为什么天空是蓝色的',
+        '请用Python写一个计算斐波那契数列的函数',
         '解释一下"光合作用"的基本过程',
-        "如果明天下雨，我应该如何出门",
-        "比较一下猫和狗作为宠物的优缺点",
-        "解释什么是机器学习",
-        "推荐一些中国的美食",
+        '如果明天下雨，我应该如何出门',
+        '比较一下猫和狗作为宠物的优缺点',
+        '解释什么是机器学习',
+        '推荐一些中国的美食'
     ]
-
+    
     conversation = []
     model, tokenizer = init_model(args)
-    input_mode = int(input("[0] 自动测试\n[1] 手动输入\n"))
+    input_mode = int(input('[0] 自动测试\n[1] 手动输入\n'))
     streamer = TextStreamer(tokenizer, skip_prompt=True, skip_special_tokens=True)
-
-    prompt_iter = prompts if input_mode == 0 else iter(lambda: input("👶: "), "")
+    
+    prompt_iter = prompts if input_mode == 0 else iter(lambda: input('💬: '), '')
     for prompt in prompt_iter:
-        setup_seed(2026)
-        if input_mode == 0:
-            print(f"👶: {prompt}")
-        conversation = conversation[-args.historys :] if args.historys else []
+        setup_seed(random.randint(0, 31415926))
+        if input_mode == 0: print(f'💬: {prompt}')
+        conversation = conversation[-args.historys:] if args.historys else []
         conversation.append({"role": "user", "content": prompt})
-
-        templates = {
-            "conversation": conversation,
-            "tokenize": False,
-            "add_generation_prompt": True,
-        }
-        if args.weight == "reason":
-            templates["enable_thinking"] = True
-        inputs = (
-            tokenizer.apply_chat_template(**templates)
-            if args.weight != "pretrain"
-            else (tokenizer.bos_token + prompt)
-        )
+        if 'pretrain' in args.weight:
+            inputs = tokenizer.bos_token + prompt
+        else:
+            inputs = tokenizer.apply_chat_template(conversation, tokenize=False, add_generation_prompt=True, open_thinking=bool(args.open_thinking))
+        
         inputs = tokenizer(inputs, return_tensors="pt", truncation=True).to(args.device)
 
-        print("🤖️: ", end="")
+        print('🧠: ', end='')
+        st = time.time()
         generated_ids = model.generate(
-            inputs=inputs["input_ids"],
-            attention_mask=inputs["attention_mask"],
-            max_new_tokens=args.max_new_tokens,
-            do_sample=True,
-            streamer=streamer,
-            pad_token_id=tokenizer.pad_token_id,
-            eos_token_id=tokenizer.eos_token_id,
-            top_p=args.top_p,
-            temperature=args.temperature,
-            repetition_penalty=1.0,
+            inputs=inputs["input_ids"], attention_mask=inputs["attention_mask"],
+            max_new_tokens=args.max_new_tokens, do_sample=True, streamer=streamer,
+            pad_token_id=tokenizer.pad_token_id, eos_token_id=tokenizer.eos_token_id,
+            top_p=args.top_p, temperature=args.temperature, repetition_penalty=1
         )
-        response = tokenizer.decode(
-            generated_ids[0][len(inputs["input_ids"][0]) :], skip_special_tokens=True
-        )
+        response = tokenizer.decode(generated_ids[0][len(inputs["input_ids"][0]):], skip_special_tokens=True)
         conversation.append({"role": "assistant", "content": response})
-        print("\n\n")
-
+        gen_tokens = len(generated_ids[0]) - len(inputs["input_ids"][0])
+        print(f'\n[Speed]: {gen_tokens / (time.time() - st):.2f} tokens/s\n\n') if args.show_speed else print('\n\n')
 
 if __name__ == "__main__":
     main()

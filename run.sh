@@ -1,12 +1,18 @@
 # pre_train
 CUDA_VISIBLE_DEVICES=0,1,2,3,4,5 torchrun --nproc_per_node=6 trainer/trainer_pretrain2.py --use_wandb \
-  --batch_size 70 \
+  --batch_size 120 \
   --epochs 2 \
-  --from_resume 1 \
-  --num_hidden_layers 12 \
-  --hidden_size 512 \
+  --num_hidden_layers 8 \
+  --hidden_size 768 \
   --data_path /root/autodl-tmp/pretrain_t2t.jsonl \
   --use_compile 1 && /usr/bin/shutdown  
+# CUDA_VISIBLE_DEVICES=0 python trainer/trainer_pretrain2.py --use_wandb \
+#   --batch_size 16 \
+#   --epochs 2 \
+#   --num_hidden_layers 8 \
+#   --hidden_size 768 \
+#   --save_dir ./test \
+#   --data_path /root/autodl-tmp/pretrain_t2t_mini.jsonl \
 # python trainer/trainer_pretrain.py --use_wandb \
 #   --batch_size  \
 #   --epochs 6 \
