@@ -56,3 +56,4 @@ dataset/*.json
 #
 dataset/*temp
 dataset/*.msc
+.codex

@@ -7,6 +7,7 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 import argparse
 import time
 import warnings
+import math
 import torch
 import torch.distributed as dist
 from contextlib import nullcontext
@@ -23,17 +24,24 @@ warnings.filterwarnings('ignore')
 def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
     start_time = time.time()
     last_step = start_step
+    optimizer_steps_per_epoch = math.ceil(iters / args.accumulation_steps)
     for step, (input_ids, labels) in enumerate(loader, start=start_step + 1):
         input_ids = input_ids.to(args.device)
         labels = labels.to(args.device)
         last_step = step
+        current_optimizer_step = (
+            epoch * optimizer_steps_per_epoch
+            + ((step - 1) // args.accumulation_steps)
+            + 1
+        )
         lr = get_lr(
-            epoch * iters + step,
-            args.epochs * iters,
+            current_optimizer_step,
+            args.epochs * optimizer_steps_per_epoch,
             args.learning_rate,
             args.warmup_steps,
             args.warmdown_ratio,
             args.final_lr_frac,
+            args.lr_schedule,
         )
         for param_group in optimizer.param_groups:
             param_group['lr'] = lr
@@ -127,6 +135,13 @@ if __name__ == "__main__":
         default=0.001,
         help="线性衰减结束时的学习率比例",
     )
+    parser.add_argument(
+        "--lr_schedule",
+        type=str,
+        default="cosine",
+        choices=["constant", "linear", "cosine"],
+        help="学习率调度类型；cosine 会在 warmup 后持续下降，linear 只在末段下降",
+    )
     parser.add_argument("--device", type=str, default="cuda:0" if torch.cuda.is_available() else "cpu", help="训练设备")
     parser.add_argument("--dtype", type=str, default="bfloat16", help="混合精度类型")
     parser.add_argument("--num_workers", type=int, default=8, help="数据加载线程数")
@@ -202,6 +217,12 @@ if __name__ == "__main__":
             )
         args.accumulation_steps = args.total_batch_size_tokens // global_micro_batch_tokens
         Logger(f"梯度累积步数(由 total_batch_size_tokens 反推): {args.accumulation_steps}")
+    total_micro_steps = math.ceil(len(train_ds) / max(args.batch_size * world_size, 1))
+    total_optimizer_steps = math.ceil(total_micro_steps / args.accumulation_steps) * args.epochs
+    Logger(
+        f"LR调度: {args.lr_schedule}, warmup_steps={args.warmup_steps}, "
+        f"total_optimizer_steps={total_optimizer_steps}, final_lr_frac={args.final_lr_frac}"
+    )
     
     # ========== 6. 从ckp恢复状态 ==========
     start_epoch, start_step = 0, 0

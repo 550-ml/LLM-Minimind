@@ -28,12 +28,24 @@ def get_lr(
     warmup_steps=0,
     warmdown_ratio=0.1,
     final_lr_frac=0.1,
+    schedule_type="linear",
 ):
     total_steps = max(total_steps, 1)
     current_step = min(max(current_step, 0), total_steps)
 
     if warmup_steps > 0 and current_step < warmup_steps:
         return lr * current_step / max(warmup_steps, 1)
+
+    if schedule_type == "constant":
+        return lr
+
+    if schedule_type == "cosine":
+        decay_steps = max(total_steps - warmup_steps, 1)
+        progress = (current_step - warmup_steps) / decay_steps
+        progress = min(max(progress, 0.0), 1.0)
+        cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
+        min_lr = lr * final_lr_frac
+        return min_lr + (lr - min_lr) * cosine
 
     warmdown_steps = int(total_steps * warmdown_ratio)
     warmdown_steps = min(max(warmdown_steps, 0), total_steps)
