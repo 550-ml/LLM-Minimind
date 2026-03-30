@@ -141,6 +141,15 @@ def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
 
 
 if __name__ == "__main__":
+    # DataLoader 默认在 Linux 上用 fork；若此前已 init CUDA（如 DDP 里 set_device），
+    # 子进程继承 CUDA 状态易触发 SIGSEGV。spawn 可避免 fork-after-CUDA。
+    import multiprocessing
+
+    try:
+        multiprocessing.set_start_method("spawn")
+    except RuntimeError:
+        pass
+
     parser = argparse.ArgumentParser(description="NanoMind Pretraining")
 
     # ========== 基础训练参数 ==========
@@ -308,7 +317,9 @@ if __name__ == "__main__":
     # 📚 上下文管理器知识点
     # CPU不支持autocast，使用nullcontext作为空操作
     autocast_ctx = (
-        nullcontext() if device_type == "cpu" else torch.amp.autocast(dtype=dtype)
+        nullcontext()
+        if device_type == "cpu"
+        else torch.amp.autocast(device_type=device_type, dtype=dtype)
     )
 
     # ========== 4. 配置WandB实验跟踪 ==========

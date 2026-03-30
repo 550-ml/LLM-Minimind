@@ -2,7 +2,7 @@
 ```
 https://www.modelscope.cn/datasets/gongjy/minimind_dataset/files
 ```
-
+modelscope download --dataset gongjy/minimind_dataset pretrain_t2t_mini.jsonl --local_dir  /root/autodl-tmp
 modelscope download --dataset gongjy/minimind_dataset sft_2048.jsonl --local_dir ./dataset
 ```
 ```

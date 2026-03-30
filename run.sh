@@ -1,9 +1,10 @@
 # pre_train
-CUDA_VISIBLE_DEVICES=0,1,2,3,4 torchrun --nproc_per_node=5 trainer/trainer_pretrain.py --use_wandb \
+CUDA_VISIBLE_DEVICES=0,1 torchrun --nproc_per_node=2 trainer/trainer_pretrain.py --use_wandb \
   --batch_size 16 \
-  --epochs 6 \
-  --total_batch_size_tokens 262144 \
-  --num_hidden_layers 10
+  --epochs 2 \
+  --num_hidden_layers 10 \
+  ----total_batch_size_tokens 262144 \
+  --data_path /root/autodl-tmp/pretrain_t2t_mini.jsonl
 # python trainer/trainer_pretrain.py --use_wandb \
 #   --batch_size  \
 #   --epochs 6 \

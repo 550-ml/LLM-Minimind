@@ -3,12 +3,15 @@ name = "nanomind"
 version = "0.1.0"
 description = "Add your description here"
 readme = "README.md"
-requires-python = ">=3.13"
+requires-python = "==3.12"
 dependencies = [
     "numpy>=2.3.4",
     "pandas>=2.3.3",
-    "torch>=2.9.0",
+    "torch==2.9.0",
     "transformers>=4.57.1",
+    "modelscope",
+    "datasets",
+    "swanlab"
 ]
 [tool.uv]
 index-url = "https://pypi.tuna.tsinghua.edu.cn/simple"
