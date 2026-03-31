@@ -1,92 +1,53 @@
-from numpy import repeat
-from transformers import PretrainedConfig
+import math
+from typing import List, Optional, Tuple, Union
 
+from numpy import repeat
+import torch
+import torch.nn as nn
+from torch.nn import init
+import torch.nn.functional as F
+from transformers import PretrainedConfig
+from transformers import GenerationMixin, PreTrainedModel, PretrainedConfig
+from transformers.activations import ACT2FN
+from transformers.modeling_outputs import CausalLMOutputWithPast
 
 class NanoMindConfig(PretrainedConfig):
     model_type = "nanomind"
-
-    def __init__(
-        self,
-        dropout: float = 0.3,
-        bos_token_id: int = 1,
-        eos_token_id: int = 2,
-        hidden_act: str = "silu",
-        hidden_size: int = 512,
-        intermediate_size: int = None,
-        max_position_embeddings: int = 32768,
-        num_attention_heads: int = 8,
-        num_hidden_layers: int = 8,
-        num_key_value_heads: int = 2,
-        vocab_size: int = 6400,
-        rms_norm_eps: float = 1e-05,
-        rope_theta: int = 1000000,
-        inference_rope_scaling: bool = False,
-        flash_attention: bool = True,
-        ############ MoE ############
-        use_moe: bool = False,
-        num_experts_per_tok: int = 2,
-        n_routed_experts: int = 4,
-        n_shared_experts: int = 1,
-        scoring_func: str = "softmax",
-        aux_loss_alpha: float = 0.01,
-        seq_aux: bool = True,
-        norm_topk_prob: bool = True,
-        **kwargs,
-    ):
+    def __init__(self, hidden_size=768, num_hidden_layers=8, use_moe=False, **kwargs):
         super().__init__(**kwargs)
-
-        self.dropout = dropout
-        self.bos_token_id = bos_token_id
-        self.eos_token_id = eos_token_id
-        self.hidden_act = hidden_act
         self.hidden_size = hidden_size
-        self.intermediate_size = intermediate_size
-        self.max_position_embeddings = max_position_embeddings
-        self.num_attention_heads = num_attention_heads
         self.num_hidden_layers = num_hidden_layers
-        self.num_key_value_heads = num_key_value_heads
-        self.vocab_size = vocab_size
-        self.rms_norm_eps = rms_norm_eps
-        self.rope_theta = rope_theta
-        self.inference_rope_scaling = inference_rope_scaling
-        self.flash_attention = flash_attention
         self.use_moe = use_moe
-        self.num_experts_per_tok = num_experts_per_tok
-        self.n_routed_experts = n_routed_experts
-        self.n_shared_experts = n_shared_experts
-        self.seq_aux = seq_aux
-        self.norm_topk_prob = norm_topk_prob
-        self.aux_loss_alpha = aux_loss_alpha
-        self.scoring_func = scoring_func
-
-        self.rope_scaling = (
-            {
-                "beta_fast": 32,
-                "beta_slow": 1,
-                "factor": 16,
-                "original_max_position_embeddings": 2048,
-                "attention_factor": 1.0,
-                "type": "yarn",
-            }
-            if self.inference_rope_scaling
-            else None
-        )
-        # attention res
-        self.attn_res_block_size = 2
-
-# Backward-compatible alias for annotations and copied model code that still
-# references the old config type name.
-
-import torch
-import math
-import torch.nn as nn
-from torch.nn import init
-from typing import Optional, Tuple, List, Union
-import torch.nn.functional as F
-from transformers.activations import ACT2FN
-from transformers import PreTrainedModel, GenerationMixin, PretrainedConfig
-from transformers.modeling_outputs import CausalLMOutputWithPast
-
+        self.dropout = kwargs.get("dropout", 0.0)
+        self.vocab_size = kwargs.get("vocab_size", 6400)
+        self.bos_token_id = kwargs.get("bos_token_id", 1)
+        self.eos_token_id = kwargs.get("eos_token_id", 2)
+        self.flash_attn = kwargs.get("flash_attn", True)
+        self.num_attention_heads = kwargs.get("num_attention_heads", 8)
+        self.num_key_value_heads = kwargs.get("num_key_value_heads", 4)
+        self.head_dim = kwargs.get("head_dim", self.hidden_size // self.num_attention_heads)
+        self.hidden_act = kwargs.get("hidden_act", 'silu')
+        self.intermediate_size = kwargs.get("intermediate_size", math.ceil(hidden_size * math.pi / 64) * 64)
+        self.max_position_embeddings = kwargs.get("max_position_embeddings", 32768)
+        self.rms_norm_eps = kwargs.get("rms_norm_eps", 1e-6)
+        self.rope_theta = kwargs.get("rope_theta", 1e6)
+        self.inference_rope_scaling = kwargs.get("inference_rope_scaling", False)
+        self.rope_scaling = {
+            "beta_fast": 32,
+            "beta_slow": 1,
+            "factor": 16,
+            "original_max_position_embeddings": 2048,
+            "attention_factor": 1.0,
+            "type": "yarn"
+        } if self.inference_rope_scaling else None
+        ### block attention residual
+        self.attn_res_block_size = 2 # 2 is the default block size for the attention residual
+        ### MoE specific configs (ignored if use_moe = False)
+        self.num_experts = kwargs.get("num_experts", 4)
+        self.num_experts_per_tok = kwargs.get("num_experts_per_tok", 1)
+        self.moe_intermediate_size = kwargs.get("moe_intermediate_size", self.intermediate_size)
+        self.norm_topk_prob = kwargs.get("norm_topk_prob", True)
+        self.router_aux_loss_coef = kwargs.get("router_aux_loss_coef", 5e-4)
 
 
 class RMSNorm(nn.Module):
@@ -104,9 +65,6 @@ class RMSNorm(nn.Module):
 class FeedForward(nn.Module):
     def __init__(self, config: NanoMindConfig):
         super().__init__()
-        if config.intermediate_size is None:
-            intermediate_size = int(config.hidden_size * 8 / 3)
-            config.intermediate_size = 64 * ((intermediate_size + 64 - 1) // 64)
         self.gate_proj = nn.Linear(config.hidden_size, config.intermediate_size, bias=False)
         self.up_proj = nn.Linear(config.hidden_size, config.intermediate_size, bias=False)
         self.down_proj = nn.Linear(config.intermediate_size, config.hidden_size, bias=False)
@@ -142,20 +100,21 @@ class GroupQueryAttention(nn.Module):
         self.k_proj = nn.Linear(config.hidden_size, self.num_kv_heads * self.head_dim, bias=False)
         self.v_proj = nn.Linear(config.hidden_size, self.num_kv_heads * self.head_dim, bias=False)
         self.o_proj = nn.Linear(self.num_attention_heads * self.head_dim, config.hidden_size, bias = False)
-
+        self.q_norm = RMSNorm(self.head_dim, eps=config.rms_norm_eps)
+        self.k_norm = RMSNorm(self.head_dim, eps=config.rms_norm_eps)
         self.attn_dropout = nn.Dropout(config.dropout)
         self.resid_dropout = nn.Dropout(config.dropout)
         self.dropout = config.dropout
         self.flash = (
             hasattr(torch.nn.functional, "scaled_dot_product_attention")
-            and config.flash_attention
+            and config.flash_attn
         )
     def forward(
         self,
         x: torch.Tensor, # [B, Seq_len, D]
         position_embedding: Tuple[torch.Tensor, torch.Tensor],
         kv_cache: Optional[Tuple[torch.Tensor, torch.Tensor]]=None,
-        use_cache=True,
+        use_cache=False,
         attention_mask:Optional[torch.Tensor] = None
     ):
         B, S, D = x.shape
@@ -163,17 +122,17 @@ class GroupQueryAttention(nn.Module):
         q = self.q_proj(x).view(B, S, self.num_attention_heads, self.head_dim)
         k = self.k_proj(x).view(B, S, self.num_kv_heads, self.head_dim)
         v = self.v_proj(x).view(B, S, self.num_kv_heads, self.head_dim)
-
+        q = self.q_norm(q)
+        k = self.k_norm(k)
         # * RoPE
         cos, sin = position_embedding
         q, k = apply_rotary_pos_emb(q, k, cos, sin)
-        q = norm(q) * 1.2
-        k = norm(k) * 1.2
+
         # * kv_cache
         if kv_cache is not None:
             k = torch.cat([kv_cache[0], k], dim=1)  # 
             v = torch.cat([kv_cache[1], v], dim=1)  # 
-        past_kv = (k, v) 
+        past_kv = (k, v) if use_cache else None
 
         q, k, v = (
             q.transpose(1, 2),
@@ -185,7 +144,10 @@ class GroupQueryAttention(nn.Module):
         Lq = q.size(2)
         Lk = k.size(2)
         if (
-            self.flash and Lq==Lk
+            self.flash
+            and Lq > 1
+            and kv_cache is None
+            and (attention_mask is None or torch.all(attention_mask == 1))
         ):
             output = F.scaled_dot_product_attention(
                 q,
@@ -194,8 +156,10 @@ class GroupQueryAttention(nn.Module):
                 dropout_p=self.dropout if self.training else 0.0,
                 is_causal=True,
             )
-        elif(
-            self.flash and  Lq ==1
+        elif (
+            self.flash
+            and Lq == 1
+            and (attention_mask is None or torch.all(attention_mask == 1))
         ):
             output = F.scaled_dot_product_attention(
                 q,
@@ -203,18 +167,18 @@ class GroupQueryAttention(nn.Module):
                 v,
                 dropout_p=self.dropout if self.training else 0.0,
                 is_causal=False,
-            ) 
+            )
         else:
-            scores = (q @ k.transpose(-1, -2)) / math.sqrt(self.head_dim)
-            scores[:,:,:, -S:] +=torch.triu(torch.full((S, S), float("-inf"), device=scores.device), diagonal=1)
+            scores = (q @ k.transpose(-2, -1)) / math.sqrt(self.head_dim)
+            if Lq > 1:
+                causal_mask = torch.triu(
+                    torch.full((Lq, Lq), float("-inf"), device=scores.device),
+                    diagonal=1,
+                )
+                scores[:, :, :, -Lq:] += causal_mask
             if attention_mask is not None:
-                extended_attention_mask = attention_mask.unsqueeze(1).unsqueeze(2)
-                extended_attention_mask = (1.0 - extended_attention_mask) * -1e9
-                scores = scores + extended_attention_mask 
-            scores = F.softmax(scores.float(), dim=-1).type_as(q)
-            scores = self.attn_dropout(scores)
-            output = scores @ v
-        
+                scores += (1.0 - attention_mask.unsqueeze(1).unsqueeze(2)) * -1e9
+            output = self.attn_dropout(F.softmax(scores.float(), dim=-1).type_as(q)) @ v
         output = output.transpose(1, 2).reshape(B, S, -1)
         output = self.resid_dropout(self.o_proj(output))
         return output, past_kv
@@ -467,12 +431,13 @@ class NanoMindForCausalLM(PreTrainedModel, GenerationMixin):
         super().__init__(config)
         self.model = NanoMindModel(config)
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
-        self.model.embed_tokens.weight = self.lm_head.weight
 
     @torch.no_grad()
     def init_weights(self):
         self.model.init_weights()
-        self.lm_head.weight = self.model.embed_tokens.weight
+        torch.nn.init.normal_(
+            self.lm_head.weight, mean=0.0, std=self.config.hidden_size**-0.5
+        )
 
     def forward(
         self,
