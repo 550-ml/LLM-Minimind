@@ -417,9 +417,7 @@ if __name__ == "__main__":
     
     # ========== 7. 编译和分布式包装 ==========
     if args.use_compile == 1:
-        actor_model = torch.compile(actor_model)
-        Logger('torch.compile enabled')
-        rollout_engine.update_policy(actor_model)
+        Logger('torch.compile is disabled for PPO because mixed rollout/train grad_mode causes excessive recompilation')
     if dist.is_initialized():
         actor_model._ddp_params_and_buffers_to_ignore = {"freqs_cos", "freqs_sin"}
         critic_model._ddp_params_and_buffers_to_ignore = {"freqs_cos", "freqs_sin"}

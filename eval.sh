@@ -6,16 +6,15 @@ cd "$(dirname "$0")"
 CUDA_VISIBLE_DEVICES=0 python eval.py \
   --load_from model \
   --save_dir out \
-  --weight pretrain \
+  --weight ppo_actor \
   --lora_weight None \
   --hidden_size 768 \
   --num_hidden_layers 8 \
   --use_moe 0 \
-  --max_new_tokens 512 \
   --temperature 0.85 \
   --top_p 0.95 \
   --open_thinking 0 \
-  --historys 0 \
+  --historys 10 \
   --show_speed 1 \
   --device cuda
 
