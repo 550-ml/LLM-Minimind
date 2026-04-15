@@ -90,14 +90,24 @@ def grpo_train_epoch(
         outputs = rollout_result.output_ids
         completion_ids = rollout_result.completion_ids
         completions = rollout_result.completions
-        old_per_token_logps = rollout_result.per_token_logps.to(args.device)
+        old_per_token_logps = rollout_result.per_token_logps.to(args.device).detach()
 
+        # rollout 可能在 inference_mode/no_grad 路径产生张量，训练前向前统一转为可被 autograd 使用的常规张量
+        if outputs.is_inference():
+            outputs = outputs.clone()
+        if completion_ids.is_inference():
+            completion_ids = completion_ids.clone()
+        attention_mask = outputs.ne(tokenizer.pad_token_id).long()
         model_unwrapped = model.module if isinstance(model, DistributedDataParallel) else model
         with autocast_ctx:
-            res = model_unwrapped(outputs)
+            res = model_unwrapped(input_ids=outputs, attention_mask=attention_mask)
             aux_loss = res.aux_loss if lm_config.use_moe else torch.tensor(0.0, device=args.device)
             logits = res.logits[:, :-1, :]
-            per_token_logps = F.log_softmax(logits, dim=-1).gather(2, outputs[:, 1:].unsqueeze(-1)).squeeze(-1)[:, -completion_ids.size(1):]
+            per_token_logps = (
+                F.log_softmax(logits, dim=-1)
+                .gather(2, outputs[:, 1:].unsqueeze(-1))
+                .squeeze(-1)[:, -completion_ids.size(1):]
+            )
         
         with torch.no_grad():
             ref_per_token_logps = compute_per_token_logps(ref_model, outputs, completion_ids.size(1))
@@ -224,7 +234,7 @@ if __name__ == "__main__":
     parser.add_argument("--data_path", type=str, default="./dataset/rlaif.jsonl", help="RLAIF数据路径")
     parser.add_argument("--num_generations", type=int, default=6, help="每个prompt生成的样本数")
     parser.add_argument("--beta", type=float, default=0.1, help="KL惩罚系数")
-    parser.add_argument("--loss_type", type=str, default="cispo", choices=["grpo", "cispo"], help="loss类型")
+    parser.add_argument("--loss_type", type=str, default="grpo", choices=["grpo", "cispo"], help="loss类型")
     parser.add_argument("--epsilon", type=float, default=0.2, help="GRPO的PPO clip epsilon")
     parser.add_argument("--epsilon_high", type=float, default=5.0, help="epsilon上界")
     parser.add_argument('--from_weight', default='full_sft', type=str, help="基于哪个权重训练")
