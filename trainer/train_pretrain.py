@@ -8,12 +8,13 @@ sys.path.append(PROJECT_ROOT)
 import argparse
 import time
 import warnings
+import math
 import torch
 import torch.distributed as dist
 from contextlib import nullcontext
 from torch import optim
 from torch.nn.parallel import DistributedDataParallel
-from torch.utils.data import DataLoader, DistributedSampler
+from torch.utils.data import DataLoader, DistributedSampler, random_split
 from model.NanoMind import NanoMindConfig
 from dataset.lm_dataset import PretrainDataset
 from trainer.trainer_utils import get_lr, Logger, is_main_process, lm_checkpoint, init_distributed_mode, setup_seed, init_model, SkipBatchSampler
@@ -21,7 +22,84 @@ from trainer.trainer_utils import get_lr, Logger, is_main_process, lm_checkpoint
 warnings.filterwarnings('ignore')
 
 
+def unwrap_model(model):
+    raw_model = model.module if isinstance(model, DistributedDataParallel) else model
+    return getattr(raw_model, '_orig_mod', raw_model)
+
+
+def register_hidden_norm_hooks(model):
+    hidden_norms = {}
+    raw_model = unwrap_model(model)
+
+    def make_hook(layer_idx):
+        def hook(_module, _inputs, output):
+            if isinstance(output, tuple) and len(output) > 1 and torch.is_tensor(output[1]):
+                hidden_norms[f"hidden_norm/layer_{layer_idx}"] = (
+                    output[1].detach().float().norm(dim=-1).mean()
+                )
+        return hook
+
+    handles = [
+        layer.register_forward_hook(make_hook(layer_idx))
+        for layer_idx, layer in enumerate(raw_model.model.layers)
+    ]
+    return hidden_norms, handles
+
+
+def get_layer_grad_norms(model):
+    raw_model = unwrap_model(model)
+    grad_norms = {}
+    for layer_idx, layer in enumerate(raw_model.model.layers):
+        squared_norm = None
+        for param in layer.parameters():
+            if param.grad is None:
+                continue
+            param_norm = param.grad.detach().float().norm(2)
+            squared = param_norm * param_norm
+            squared_norm = squared if squared_norm is None else squared_norm + squared
+        if squared_norm is not None:
+            grad_norms[f"grad_norm/layer_{layer_idx}"] = torch.sqrt(squared_norm).item()
+    return grad_norms
+
+
+@torch.no_grad()
+def evaluate(loader, max_batches=0):
+    if loader is None:
+        return None
+
+    model.eval()
+    total_loss = torch.tensor(0.0, device=args.device)
+    total_tokens = torch.tensor(0.0, device=args.device)
+
+    for batch_idx, (input_ids, labels) in enumerate(loader, start=1):
+        if max_batches > 0 and batch_idx > max_batches:
+            break
+
+        input_ids = input_ids.to(args.device)
+        labels = labels.to(args.device)
+        with autocast_ctx:
+            res = model(input_ids, labels=labels)
+
+        valid_tokens = (labels[..., 1:] != -100).sum()
+        if res.loss is not None and valid_tokens.item() > 0:
+            total_loss += res.loss.detach().float() * valid_tokens
+            total_tokens += valid_tokens
+
+        del input_ids, labels, res
+
+    if dist.is_initialized():
+        dist.all_reduce(total_loss, op=dist.ReduceOp.SUM)
+        dist.all_reduce(total_tokens, op=dist.ReduceOp.SUM)
+
+    avg_loss = total_loss / total_tokens.clamp(min=1)
+    loss_value = avg_loss.item()
+    ppl_value = math.exp(loss_value) if loss_value < 50 else float("inf")
+    model.train()
+    return {"valid_loss": loss_value, "valid_ppl": ppl_value}
+
+
 def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
+    global last_grad_metrics
     start_time = time.time()
     last_step = start_step
     for step, (input_ids, labels) in enumerate(loader, start=start_step + 1):
@@ -39,9 +117,13 @@ def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
 
         scaler.scale(loss).backward()
 
+        total_grad_norm = None
+        layer_grad_norms = {}
         if step % args.accumulation_steps == 0:
             scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+            total_grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+            layer_grad_norms = get_layer_grad_norms(model)
+            last_grad_metrics = {"grad_norm/total": float(total_grad_norm), **layer_grad_norms}
 
             scaler.step(optimizer)
             scaler.update()
@@ -55,8 +137,23 @@ def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
             current_logits_loss = current_loss - current_aux_loss
             current_lr = optimizer.param_groups[-1]['lr']
             eta_min = spend_time / max(step - start_step, 1) * (iters - step) // 60
+            log_data = {
+                "loss": current_loss,
+                "logits_loss": current_logits_loss,
+                "aux_loss": current_aux_loss,
+                "learning_rate": current_lr,
+                "epoch_time": eta_min,
+            }
+            log_data.update(last_grad_metrics)
+            log_data.update({key: value.item() for key, value in hidden_norms.items()})
             Logger(f'Epoch:[{epoch + 1}/{args.epochs}]({step}/{iters}), loss: {current_loss:.4f}, logits_loss: {current_logits_loss:.4f}, aux_loss: {current_aux_loss:.4f}, lr: {current_lr:.8f}, epoch_time: {eta_min:.1f}min')
-            if wandb: wandb.log({"loss": current_loss, "logits_loss": current_logits_loss, "aux_loss": current_aux_loss, "learning_rate": current_lr, "epoch_time": eta_min})
+            if wandb: wandb.log(log_data)
+
+        if args.eval_interval > 0 and val_loader is not None and (step % args.eval_interval == 0 or step == iters):
+            metrics = evaluate(val_loader, args.eval_batches)
+            if metrics is not None and is_main_process():
+                Logger(f'Validation: loss: {metrics["valid_loss"]:.4f}, ppl: {metrics["valid_ppl"]:.2f}')
+                if wandb: wandb.log(metrics)
 
         if (step % args.save_interval == 0 or step == iters) and is_main_process():
             model.eval()
@@ -104,6 +201,10 @@ if __name__ == "__main__":
     parser.add_argument("--use_wandb", action="store_true", help="是否使用wandb")
     parser.add_argument("--wandb_project", type=str, default="NanoMind-Pretrain", help="wandb项目名")
     parser.add_argument("--use_compile", default=0, type=int, choices=[0, 1], help="是否使用torch.compile加速（0=否，1=是）")
+    parser.add_argument("--model_variant", type=str, default="full", choices=["full", "baseline"], help="模型变体：full=NanoMind BAR，baseline=无BAR")
+    parser.add_argument("--val_ratio", type=float, default=0.02, help="从训练集固定切出的验证集比例，0表示不验证")
+    parser.add_argument("--eval_interval", type=int, default=1000, help="验证间隔step，0表示不验证")
+    parser.add_argument("--eval_batches", type=int, default=0, help="每次验证最多跑多少个batch，0表示跑完整验证集")
     args = parser.parse_args()
 
     # ========== 1. 初始化环境和随机种子 ==========
@@ -127,15 +228,26 @@ if __name__ == "__main__":
         import swanlab as wandb
         wandb_id = ckp_data.get('wandb_id') if ckp_data else None
         resume = 'must' if wandb_id else None
-        wandb_run_name = f"NanoMind-Pretrain-Epoch-{args.epochs}-BatchSize-{args.batch_size}-LearningRate-{args.learning_rate}"
+        wandb_run_name = f"NanoMind-{args.model_variant}-Pretrain-Epoch-{args.epochs}-BatchSize-{args.batch_size}-LearningRate-{args.learning_rate}"
         wandb.init(project=args.wandb_project, name=wandb_run_name, id=wandb_id, resume=resume)
     
     # ========== 5. 定义模型、数据、优化器 ==========
-    model, tokenizer = init_model(lm_config, args.from_weight, device=args.device)
-    train_ds = PretrainDataset(args.data_path, tokenizer, max_length=args.max_seq_len)
+    model, tokenizer = init_model(lm_config, args.from_weight, device=args.device, model_variant=args.model_variant)
+    full_ds = PretrainDataset(args.data_path, tokenizer, max_length=args.max_seq_len)
+    val_loader = None
+    if args.val_ratio > 0:
+        val_size = max(1, int(len(full_ds) * args.val_ratio))
+        train_size = len(full_ds) - val_size
+        train_ds, val_ds = random_split(full_ds, [train_size, val_size], generator=torch.Generator().manual_seed(42))
+        val_sampler = DistributedSampler(val_ds, shuffle=False) if dist.is_initialized() else None
+        val_loader = DataLoader(val_ds, batch_size=args.batch_size, sampler=val_sampler, shuffle=False, num_workers=args.num_workers, pin_memory=True)
+        Logger(f'Dataset Split: train={train_size}, valid={val_size}, val_ratio={args.val_ratio}')
+    else:
+        train_ds = full_ds
     train_sampler = DistributedSampler(train_ds) if dist.is_initialized() else None
     scaler = torch.amp.GradScaler(enabled=(args.dtype == 'float16'))
     optimizer = optim.AdamW(model.parameters(), lr=args.learning_rate)
+    last_grad_metrics = {}
     
     # ========== 6. 从ckp恢复状态 ==========
     start_epoch, start_step = 0, 0
@@ -153,6 +265,7 @@ if __name__ == "__main__":
     if dist.is_initialized():
         model._ddp_params_and_buffers_to_ignore = {"freqs_cos", "freqs_sin"}
         model = DistributedDataParallel(model, device_ids=[local_rank])
+    hidden_norms, hidden_hook_handles = register_hidden_norm_hooks(model)
     
     # ========== 8. 开始训练 ==========
     for epoch in range(start_epoch, args.epochs):

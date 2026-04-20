@@ -14,6 +14,7 @@ from torch.nn.parallel import DistributedDataParallel
 from torch.utils.data import Sampler
 from transformers import AutoTokenizer, AutoModel, AutoModelForSequenceClassification
 from model.NanoMind import NanoMindForCausalLM
+from model.Baseline import NanoMindForCausalLM as BaselineForCausalLM
 
 def get_model_params(model, config):
     total = sum(p.numel() for p in model.parameters()) / 1e6
@@ -116,9 +117,11 @@ def lm_checkpoint(lm_config, weight='full_sft', model=None, optimizer=None, epoc
         return None
 
 
-def init_model(lm_config, from_weight='pretrain', tokenizer_path='./model', save_dir='./out', device='cuda'):
+def init_model(lm_config, from_weight='pretrain', tokenizer_path='./model', save_dir='./out', device='cuda', model_variant='full'):
     tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
-    model = NanoMindForCausalLM(lm_config)
+    model_cls = BaselineForCausalLM if model_variant == 'baseline' else NanoMindForCausalLM
+    model = model_cls(lm_config)
+    Logger(f'Model Variant: {model_variant}')
 
     if from_weight!= 'none':
         moe_suffix = '_moe' if lm_config.use_moe else ''
